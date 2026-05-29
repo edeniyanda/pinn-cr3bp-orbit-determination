@@ -8,7 +8,7 @@ def plot_classical_baseline():
     # Resolve the absolute path to your data file
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
-    data_path = os.path.join(project_root, 'data', 'ground_truth_trajectory.npy')
+    data_path = os.path.join(project_root, 'data', 'ground_truth_raw.npy')
     
     try:
         # Load the unscaled SciPy ground truth data

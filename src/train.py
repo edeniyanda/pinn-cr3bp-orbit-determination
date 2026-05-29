@@ -1,142 +1,120 @@
 import os
 import torch
+import numpy as np
 import torch.nn as nn
 from network import Jacobi_PINN
+from physics import CislunarEnvironment
 
-
-
-
-def calculate_physics_loss(pinn_model, t_tensor, mu, C_true):
+def calculate_physics_loss(model, t_tensor, env, C_true):
     """
-    Calculates the PDE residual loss and the Jacobi Constant penalty.
-    t_tensor: A column tensor of times with requires_grad=True
-    mu: The mass parameter (approx 0.01215)
-    C_true: The exact Jacobi Constant calculated from your initial state X0
+    Calculates the 3D PDE residual loss and your Jacobi Constant penalty.
     """
+    # 1. Forward Pass
+    preds = model(t_tensor)
+    x, y, z = preds[:, 0:1], preds[:, 1:2], preds[:, 2:3]
+    vx, vy, vz = preds[:, 3:4], preds[:, 4:5], preds[:, 5:6]
     
-    # Forward Pass: Get the constrained predictions
-    preds = pinn_model(t_tensor)
-    x  = preds[:, 0:1]
-    y  = preds[:, 1:2]
-    z  = preds[:, 2:3]
-    vx = preds[:, 3:4]
-    vy = preds[:, 4:5]
-    vz = preds[:, 5:6]
+    # 2. Extract Gradients via Autograd (Kinematics & Accelerations)
+    dx_dt = torch.autograd.grad(x, t_tensor, torch.ones_like(x), create_graph=True)[0]
+    dy_dt = torch.autograd.grad(y, t_tensor, torch.ones_like(y), create_graph=True)[0]
+    dz_dt = torch.autograd.grad(z, t_tensor, torch.ones_like(z), create_graph=True)[0]
     
-    # Automatic Differentiation (Extracting Accelerations)
-    # We take the derivative of the predicted velocities with respect to time (t)
-    # create_graph=True allows us to backpropagate through this derivative later
-    dvx_dt = torch.autograd.grad(vx, t_tensor, grad_outputs=torch.ones_like(vx), create_graph=True)[0]
-    dvy_dt = torch.autograd.grad(vy, t_tensor, grad_outputs=torch.ones_like(vy), create_graph=True)[0]
-    dvz_dt = torch.autograd.grad(vz, t_tensor, grad_outputs=torch.ones_like(vz), create_graph=True)[0]
+    dvx_dt = torch.autograd.grad(vx, t_tensor, torch.ones_like(vx), create_graph=True)[0]
+    dvy_dt = torch.autograd.grad(vy, t_tensor, torch.ones_like(vy), create_graph=True)[0]
+    dvz_dt = torch.autograd.grad(vz, t_tensor, torch.ones_like(vz), create_graph=True)[0]
     
-    # Dynamic Geometry (Distances to Earth and Moon)
-    r1 = torch.sqrt((x + mu)**2 + y**2 + z**2)
-    r2 = torch.sqrt((x - (1 - mu))**2 + y**2 + z**2)
+    # 3. Dynamic Geometry & Pseudo-Potential Gradients
+    r1_cubed = ((x - env.earth_pos_x)**2 + y**2 + z**2)**1.5
+    r2_cubed = ((x - env.moon_pos_x)**2 + y**2 + z**2)**1.5
     
-    # otential Gradients (The Forces)
-    dU_dx = x - ((1 - mu) * (x + mu) / r1**3) - (mu * (x - (1 - mu)) / r2**3)
-    dU_dy = y - ((1 - mu) * y / r1**3) - (mu * y / r2**3)
-    dU_dz =   - ((1 - mu) * z / r1**3) - (mu * z / r2**3)
+    dU_dx = x - ((1 - env.mu)*(x - env.earth_pos_x)/r1_cubed) - (env.mu*(x - env.moon_pos_x)/r2_cubed)
+    dU_dy = y - ((1 - env.mu)*y/r1_cubed) - (env.mu*y/r2_cubed)
+    dU_dz =   - ((1 - env.mu)*z/r1_cubed) - (env.mu*z/r2_cubed)
     
-    # The ODE Residuals (Equations of Motion)
-    # If the network predicts perfect physics, these will all equal 0.0
-    res_x = dvx_dt - 2*vy - dU_dx
-    res_y = dvy_dt + 2*vx - dU_dy
-    res_z = dvz_dt - dU_dz
+    # 4. ODE Residuals (Forces Network to obey Newton/Coriolis)
+    res_x = dx_dt - vx
+    res_y = dy_dt - vy
+    res_z = dz_dt - vz
+    res_vx = dvx_dt - (2*vy + dU_dx)
+    res_vy = dvy_dt - (-2*vx + dU_dy)
+    res_vz = dvz_dt - dU_dz
     
-    loss_ODE = torch.mean(res_x**2 + res_y**2 + res_z**2)
+    loss_ODE = torch.mean(res_x**2 + res_y**2 + res_z**2 + res_vx**2 + res_vy**2 + res_vz**2)
     
-    # The Jacobi Constant Penalty (Your Thesis Contribution)
-    # Calculate the instantaneous energy at every predicted coordinate
-    omega_term = (x**2 + y**2) + 2*(1 - mu)/r1 + 2*mu/r2 + mu*(1 - mu)
-    velocity_sq = vx**2 + vy**2 + vz**2
-    C_pred = omega_term - velocity_sq
+    # 5. Jacobi Constant Penalty (Enforces Zero Velocity Surfaces)
+    r1 = torch.sqrt((x - env.earth_pos_x)**2 + y**2 + z**2)
+    r2 = torch.sqrt((x - env.moon_pos_x)**2 + y**2 + z**2)
+    omega = (x**2 + y**2) + 2*(1 - env.mu)/r1 + 2*env.mu/r2 + env.mu*(1 - env.mu)
+    v_sq = vx**2 + vy**2 + vz**2
+    C_pred = omega - v_sq
     
     loss_C = torch.mean((C_pred - C_true)**2)
     
     return loss_ODE, loss_C
 
-
-
-# Initialization
-mu = 0.0121505856
-X0 = [0.836915, 0.0, 0.150020, 0.0, 0.215033, 0.0] # Your perfected starting state
-C_true = 3.189 # Calculate this analytically from X0 beforehand
-
-# Instantiate your model and optimizer
-model = Jacobi_PINN(X0)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-# Prepare the time tensor (MUST have requires_grad=True for autograd to work)
-t_train = torch.linspace(0, 2.74, 1000).view(-1, 1).requires_grad_(True)
-
-# The Training Loop
-
-# --- STAGE 1: Adam Optimization (Exploration) ---
-print("--- Starting Stage 1: Adam Optimizer ---")
-adam_epochs = 2000
-for epoch in range(adam_epochs):
-    optimizer.zero_grad()
+def train_model():
+    # Environment & Initialization
+    env = CislunarEnvironment()
+    X0 = [0.836915, 0.0, 0.150020, 0.0, 0.215033, 0.0]
+    T = 2.743
     
-    loss_ODE, loss_C = calculate_physics_loss(model, t_train, mu, C_true)
-    
-    w_ODE, w_C = 1.0, 10.0
-    total_loss = (w_ODE * loss_ODE) + (w_C * loss_C)
-    
-    total_loss.backward()
-    optimizer.step()
-    
-    if epoch % 500 == 0:
-        print(f"Adam Epoch {epoch} | ODE Loss: {loss_ODE.item():.6f} | Jacobi Loss: {loss_C.item():.6f}")
+    # Pre-calculate true Jacobi constant from X0
+    C_true = env.calculate_jacobi_constant(np.array(X0))
+    C_true = torch.tensor(C_true, dtype=torch.float32)
 
-# --- STAGE 2: L-BFGS Optimization (Exploitation) ---
-print("\n--- Starting Stage 2: L-BFGS Optimizer ---")
-# L-BFGS requires strict parameter tuning to prevent it from stalling
-lbfgs_optimizer = torch.optim.LBFGS(
-    model.parameters(),
-    lr=1.0,
-    max_iter=5000,
-    max_eval=5000,
-    tolerance_grad=1e-7,
-    tolerance_change=1e-9,
-    history_size=100,
-    line_search_fn="strong_wolfe" # Critical for chaotic PDEs
-)
-
-# L-BFGS requires a closure function to re-evaluate the loss multiple times per step
-epoch_lbfgs = 0
-def closure():
-    global epoch_lbfgs
-    lbfgs_optimizer.zero_grad()
+    model = Jacobi_PINN(X0)
     
-    loss_ODE, loss_C = calculate_physics_loss(model, t_train, mu, C_true)
-    
-    w_ODE, w_C = 1.0, 10.0
-    total_loss = (w_ODE * loss_ODE) + (w_C * loss_C)
-    
-    total_loss.backward()
-    
-    if epoch_lbfgs % 100 == 0:
-        print(f"L-BFGS Step {epoch_lbfgs} | ODE Loss: {loss_ODE.item():.8f} | Jacobi Loss: {loss_C.item():.8f}")
-    
-    epoch_lbfgs += 1
-    return total_loss
+    # Time tensor requires_grad for Autograd to work
+    t_train = torch.linspace(0, T, 1500).view(-1, 1).requires_grad_(True)
 
-# Execute the L-BFGS closure loop
-lbfgs_optimizer.step(closure)
+    # --- STAGE 1: Adam Optimizer ---
+    print("--- Starting Stage 1: Adam Optimizer ---")
+    adam_optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    epochs = 2000
+    
+    for epoch in range(epochs):
+        adam_optimizer.zero_grad()
+        loss_ODE, loss_C = calculate_physics_loss(model, t_train, env, C_true)
+        total_loss = loss_ODE + (10.0 * loss_C) # Heavy weight on Jacobi penalty
+        total_loss.backward()
+        adam_optimizer.step()
+        
+        if epoch % 500 == 0:
+            print(f"Adam Epoch {epoch} | ODE Loss: {loss_ODE.item():.6f} | Jacobi Loss: {loss_C.item():.6f}")
 
-# --- SAVING THE MODEL ---
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-save_dir = os.path.join(project_root, 'models')
-os.makedirs(save_dir, exist_ok=True)
+    # --- STAGE 2: L-BFGS Optimizer ---
+    print("\n--- Starting Stage 2: L-BFGS Optimizer ---")
+    lbfgs_optimizer = torch.optim.LBFGS(
+        model.parameters(), lr=1.0, max_iter=2000, tolerance_grad=1e-7,
+        tolerance_change=1e-9, history_size=100, line_search_fn="strong_wolfe"
+    )
 
-save_path = os.path.join(save_dir, 'jacobi_pinn_weights.pth')
-torch.save(model.state_dict(), save_path)
-print(f"\nTraining complete. Model weights saved strictly to {save_path}")
+    epoch_lbfgs = 0
+    def closure():
+        nonlocal epoch_lbfgs
+        lbfgs_optimizer.zero_grad()
+        loss_ODE, loss_C = calculate_physics_loss(model, t_train, env, C_true)
+        total_loss = loss_ODE + (10.0 * loss_C)
+        total_loss.backward()
+        
+        if epoch_lbfgs % 100 == 0:
+            print(f"L-BFGS Step {epoch_lbfgs} | ODE Loss: {loss_ODE.item():.8f} | Jacobi Loss: {loss_C.item():.8f}")
+        epoch_lbfgs += 1
+        return total_loss
 
+    lbfgs_optimizer.step(closure)
+
+    # --- SAVE MODEL ---
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    save_dir = os.path.join(os.path.dirname(current_dir), 'models')
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, 'jacobi_pinn_weights.pth')
+    
+    torch.save(model.state_dict(), save_path)
+    print(f"\nTraining complete. Model weights saved to {save_path}")
+
+if __name__ == "__main__":
+    train_model()
 
 # for epoch in range(epochs):
 #     optimizer.zero_grad()

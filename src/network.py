@@ -5,10 +5,10 @@ class Jacobi_PINN(nn.Module):
     def __init__(self, X0):
         super(Jacobi_PINN, self).__init__()
         
-        # Store the perfect initial boundary (No epsilon parameters needed!)
+        # Store the perfect Spatial initial boundary
         self.X0 = torch.tensor(X0, dtype=torch.float32)
         
-        #  Deep Learning Topology
+        # Deep Learning Topology (6 inputs for 3D state)
         self.network = nn.Sequential(
             nn.Linear(1, 128),
             nn.Tanh(),
@@ -16,7 +16,7 @@ class Jacobi_PINN(nn.Module):
             nn.Tanh(),
             nn.Linear(128, 128),
             nn.Tanh(),
-            nn.Linear(128, 6) # Outputs 6 raw state variables
+            nn.Linear(128, 6) # Outputs [x, y, z, vx, vy, vz]
         )
         
     def forward(self, t):
@@ -26,7 +26,8 @@ class Jacobi_PINN(nn.Module):
         raw_output = self.network(t)
         raw_x, raw_y, raw_z, raw_vx, raw_vy, raw_vz = raw_output.chunk(6, dim=1)
         
-        # Hard Constraint (The Ansatz)
+        # Hard Constraints (The Ansatz)
+        # Forces the network to equal X0 exactly when t = 0
         x  = t * raw_x  + self.X0[0]
         y  = t * raw_y  + self.X0[1]
         z  = t * raw_z  + self.X0[2]
@@ -35,5 +36,3 @@ class Jacobi_PINN(nn.Module):
         vz = t * raw_vz + self.X0[5]
         
         return torch.cat([x, y, z, vx, vy, vz], dim=1)
-    
-
