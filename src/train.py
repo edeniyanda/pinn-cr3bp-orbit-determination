@@ -40,7 +40,8 @@ def calculate_physics_loss(model, t_tensor, env, C_true):
     res_vz = dvz_dt - dU_dz
     
     loss_ODE = torch.mean(res_x**2 + res_y**2 + res_z**2 + res_vx**2 + res_vy**2 + res_vz**2)
-    
+
+
     # 5. Jacobi Constant Penalty (Enforces Zero Velocity Surfaces)
     r1 = torch.sqrt((x - env.earth_pos_x)**2 + y**2 + z**2)
     r2 = torch.sqrt((x - env.moon_pos_x)**2 + y**2 + z**2)
@@ -50,6 +51,7 @@ def calculate_physics_loss(model, t_tensor, env, C_true):
     
     loss_C = torch.mean((C_pred - C_true)**2)
     
+    # REMOVED L_p ENTIRELY
     return loss_ODE, loss_C
 
 def train_model():
@@ -58,14 +60,23 @@ def train_model():
     X0 = [0.836915, 0.0, 0.150020, 0.0, 0.215033, 0.0]
     T = 2.743
     
-    # Pre-calculate true Jacobi constant from X0
+    # 1. LOAD GROUND TRUTH DATA (The Missing Anchor)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    data_path = os.path.join(project_root, 'data', 'ground_truth_raw.npy')
+    
+    trajectory_data = np.load(data_path)
+    # We generated 10000 points in data_loader, we will train on them
+    X_true = torch.tensor(trajectory_data, dtype=torch.float32)
+    
+    # Time tensor matching the data points
+    num_points = 10000
+    t_train = torch.linspace(0, T, num_points).view(-1, 1).requires_grad_(True)
+
     C_true = env.calculate_jacobi_constant(np.array(X0))
     C_true = torch.tensor(C_true, dtype=torch.float32)
 
     model = Jacobi_PINN(X0)
-    
-    # Time tensor requires_grad for Autograd to work
-    t_train = torch.linspace(0, T, 1500).view(-1, 1).requires_grad_(True)
 
     # --- STAGE 1: Adam Optimizer ---
     print("--- Starting Stage 1: Adam Optimizer ---")
@@ -74,18 +85,27 @@ def train_model():
     
     for epoch in range(epochs):
         adam_optimizer.zero_grad()
+        
+        # Get physics loss
         loss_ODE, loss_C = calculate_physics_loss(model, t_train, env, C_true)
-        total_loss = loss_ODE + (10.0 * loss_C) # Heavy weight on Jacobi penalty
+        
+        # Get Data Loss (MSE against SciPy truth)
+        preds = model(t_train)
+        loss_Data = torch.mean((preds - X_true)**2)
+        
+        # HYBRID TOTAL LOSS: Data + Physics + Energy Penalty
+        total_loss = (1.0 * loss_Data) + (1e-4 * loss_ODE) + (1e-3 * loss_C)
+        
         total_loss.backward()
         adam_optimizer.step()
         
         if epoch % 500 == 0:
-            print(f"Adam Epoch {epoch} | ODE Loss: {loss_ODE.item():.6f} | Jacobi Loss: {loss_C.item():.6f}")
-
+            print(f"Adam Epoch {epoch} | Data: {loss_Data.item():.5f} | ODE: {loss_ODE.item():.5f} | Jacobi: {loss_C.item():.5f}")
+            
     # --- STAGE 2: L-BFGS Optimizer ---
     print("\n--- Starting Stage 2: L-BFGS Optimizer ---")
     lbfgs_optimizer = torch.optim.LBFGS(
-        model.parameters(), lr=1.0, max_iter=2000, tolerance_grad=1e-7,
+        model.parameters(), lr=1.0, max_iter=5000, tolerance_grad=1e-7,
         tolerance_change=1e-9, history_size=100, line_search_fn="strong_wolfe"
     )
 
@@ -93,26 +113,30 @@ def train_model():
     def closure():
         nonlocal epoch_lbfgs
         lbfgs_optimizer.zero_grad()
+        
         loss_ODE, loss_C = calculate_physics_loss(model, t_train, env, C_true)
-        total_loss = loss_ODE + (10.0 * loss_C)
+        preds = model(t_train)
+        loss_Data = torch.mean((preds - X_true)**2)
+        
+        total_loss = (1.0 * loss_Data) + (1e-4 * loss_ODE) + (1e-3 * loss_C)
         total_loss.backward()
         
         if epoch_lbfgs % 100 == 0:
-            print(f"L-BFGS Step {epoch_lbfgs} | ODE Loss: {loss_ODE.item():.8f} | Jacobi Loss: {loss_C.item():.8f}")
+            print(f"L-BFGS Step {epoch_lbfgs} | Data: {loss_Data.item():.6f} | ODE: {loss_ODE.item():.6f}")
         epoch_lbfgs += 1
         return total_loss
 
     lbfgs_optimizer.step(closure)
-
+    
     # --- SAVE MODEL ---
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    save_dir = os.path.join(os.path.dirname(current_dir), 'models')
+    save_dir = os.path.join(project_root, 'models')
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, 'jacobi_pinn_weights.pth')
     
     torch.save(model.state_dict(), save_path)
     print(f"\nTraining complete. Model weights saved to {save_path}")
 
+    
 if __name__ == "__main__":
     train_model()
 
